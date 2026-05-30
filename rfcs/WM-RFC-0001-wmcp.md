@@ -2,7 +2,7 @@
 WM-RFC: 0001
 Title: World Model Context Protocol (WMCP) — A Latent World Interface for Action-Conditioned Predictive Models
 Author: Abdelhamid Bakhta (@AbdelStark)
-Status: Draft (for community review)
+Status: Draft
 Type: Standards Track
 Category: Interface
 Created: 2026-05-30
