@@ -73,7 +73,7 @@ what makes a standard adoptable rather than aspirational.
 
 | #    | Title | Status | Summary |
 |------|-------|--------|---------|
-| [0001](rfcs/WM-RFC-0001-wmcp.md) | World Model Context Protocol (WMCP) | Draft | A latent-space runtime interface for action-conditioned predictive models: a verb set, a capability/Descriptor model, and invariants (no-mutation, determinism, handle lifetime), with both an in-process and an MCP-compatible wire binding. |
+| [0001](rfcs/WM-RFC-0001-wmcp.md) | World Model Context Protocol (WMCP) | Draft | A latent-space runtime interface for action-conditioned predictive models: a verb set, a capability/Descriptor model, and invariants (no-mutation, determinism, handle lifetime), with both an in-process binding and a JSON-RPC wire binding with MCP-compatible and plain profiles. |
 
 The full index, including reserved and planned numbers, is in
 [`rfcs/README.md`](rfcs/README.md). The complete reference list and relation to
@@ -104,18 +104,18 @@ Every RFC carries a machine-readable preamble checked in CI by a dependency-free
 linter — run it locally before any PR:
 
 ```bash
-python tools/validate_rfcs.py
+python3 tools/validate_rfcs.py
 ```
 
 ## Relation to existing standards
 
 WM-RFCs are designed to ride existing ecosystems rather than reinvent them:
 
-- **MCP (Model Context Protocol)** — the wire binding is an MCP-compatible
-  extension, reusing its lifecycle, JSON-RPC framing, capability negotiation,
-  transport, and authentication. WMCP adds what MCP has no need for: latent
-  state as a branchable resource, uncertainty as a first-class field, and an
-  in-process binding.
+- **MCP (Model Context Protocol)** — the preferred wire profile is an
+  MCP-compatible extension, reusing its lifecycle, JSON-RPC framing, capability
+  negotiation, transport, and authentication. WMCP adds what MCP has no need
+  for: latent state as a branchable resource, uncertainty as a first-class
+  field, and an in-process binding.
 - **Gymnasium** — `reset()`/`step()` generalized to branchable,
   non-destructive, latent-addressed dynamics with capability negotiation.
 - **RLDS / Open X-Embodiment / LeRobot** — complementary data-layer standards.

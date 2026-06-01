@@ -102,7 +102,7 @@ finalize; it makes the text citable and reviewable.
    reused.
 3. **Draft.** Copy `rfcs/WM-RFC-0000-template.md` to
    `rfcs/WM-RFC-NNNN-<slug>.md`, set `Status: Draft`, and write. Run
-   `python tools/validate_rfcs.py` locally.
+   `python3 tools/validate_rfcs.py` locally.
 4. **Open a PR.** Set `Status: Review`. The PR description should summarize the
    proposal and link the discussion. CI runs the structural linter.
 5. **Review.** Editors and the community comment. Resolve substantive feedback

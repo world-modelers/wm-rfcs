@@ -48,7 +48,7 @@ The only required check is the structural linter, which runs in CI and has no
 dependencies:
 
 ```bash
-python tools/validate_rfcs.py
+python3 tools/validate_rfcs.py
 ```
 
 It verifies the preamble contract, filename convention, number uniqueness, and
