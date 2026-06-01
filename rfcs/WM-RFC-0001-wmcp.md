@@ -19,13 +19,13 @@ Where the Model Context Protocol (MCP) standardizes how AI applications expose t
 
 WMCP is defined as an **abstract interface** — a verb set, a capability model, a Descriptor, and a set of invariants — independent of how bytes move. It has two conformant **bindings**: an **in-process binding** for local inference and planning, where Latents are live in-memory (CPU/GPU) tensors and the model runs in the planner's own address space with no serialization; and a **wire binding** over JSON-RPC 2.0, with an MCP-compatible profile for remote and multi-tenant serving and a plain JSON-RPC profile for deployments that deliberately do not claim MCP compatibility. A conforming planner targets the abstract interface; a runtime maps that interface to the selected binding and applies negotiated polyfills when optional features are absent, so the planner's algorithm is written once and the binding-specific adapter handles transport and tensor exchange.
 
-WMCP is designed for adoption first: a **small required core** (implementable in an afternoon), capability negotiation, and Client-side **polyfills** so a minimal model still works with a sophisticated planner. The intent is to turn today's M×N integration problem — every planner hand-wired to every model — into M+N.
+WMCP is designed for adoption first: a **small required core**, capability negotiation, and Client-side **polyfills** so a minimal model still works with a sophisticated planner. The intent is to turn today's M×N integration problem — every planner hand-wired to every model — into M+N.
 
-WMCP standardizes the *interaction contract* — an application binary interface (ABI), not an ontology. It does **not** standardize the latent representation, training objective, architecture, reward function, or robot embodiment taxonomy; those are deliberately out of scope or pushed to extension registries (§19). The modeling paradigm (JEPA-style, diffusion, autoregressive) is unsettled, and freezing it would be premature standardization.
+WMCP standardizes the *runtime interaction contract*, not an ontology. It does **not** standardize the latent representation, training objective, architecture, reward function, or robot embodiment taxonomy; those are deliberately out of scope or pushed to extension registries (§19). The modeling paradigm (JEPA-style, diffusion, autoregressive) is unsettled, and freezing it would be premature standardization.
 
 ## Motivation
 
-The embodied-AI stack has a mature **data/trace layer** — RLDS canonicalizes Open X-Embodiment, and LeRobot has converged delivery on Parquet+MP4 — but that standardizes *recorded* trajectories, not *runtime queries* against a model. At runtime, every world-model vendor exposes a bespoke surface (NVIDIA Cosmos via NIM/Triton with JSON `controlnet_specs`; other foundation models via their own APIs; JEPA-family research models via ad-hoc Python). A planner that wants to evaluate action sequences across two world models writes two integrations; a model author who wants reach courts each planner individually. This is the friction MCP removed for tools, and WMCP removes it for world models.
+The embodied-AI stack has a mature **data/trace layer** — RLDS canonicalizes Open X-Embodiment, and LeRobot has converged delivery on Parquet+MP4 — but that standardizes *recorded* trajectories, not *runtime queries* against a model. At runtime, every world-model vendor exposes a bespoke surface (NVIDIA Cosmos via NIM/Triton with JSON `controlnet_specs`; other foundation models via their own APIs; JEPA-family research models via ad-hoc Python). A planner that wants to evaluate action sequences across two world models writes two integrations; a model author seeking adoption must court each planner individually. This is the friction MCP removed for tools, and WMCP removes it for world models.
 
 Two deployment regimes must both be first-class, because real systems span them:
 
@@ -41,12 +41,12 @@ The closest existing runtime contract, Gymnasium's `reset()` / `step(action)`, i
 ## 1. Design Principles
 
 - **P1 — Minimal required surface.** The mandatory core is small enough to implement quickly against any model that can encode an observation and advance one step.
-- **P2 — Capability negotiation, safe by default.** Servers advertise what they support; a Client treats any unrecognized capability as absent, and a Server ignores request fields it does not understand. The protocol grows without breaking either side.
+- **P2 — Capability negotiation, safe by default.** Servers advertise what they support; a Client treats any unrecognized capability as absent, and a Server ignores unknown optional request fields unless they are named in `requires_extensions` (§2). The protocol grows without breaking either side.
 - **P3 — Graceful degradation.** A Client SHOULD polyfill an unsupported optional verb locally where feasible (§5). A minimal model remains usable by an advanced planner.
 - **P4 — Binding independence.** Semantics, the Descriptor, capabilities, and invariants are defined once, independent of transport. In-process and wire bindings are equally first-class (§3); a planner's algorithm targets the abstract interface and binding adapters handle transport and tensor exchange.
 - **P5 — Control/data plane separation.** Method calls, Handles, and small scalars (the control plane) are decoupled from bulk tensors — observations, **actions**, latents, decoded frames, gradients (the data plane). Bulk data moves over the cheapest channel both sides support (§4). Tensors are never forced through JSON beyond a bounded inline fallback.
 - **P6 — Ride existing ecosystems.** Reuse the MCP lifecycle for the MCP-compatible wire profile, DLPack for in-process tensors, Arrow for batched/columnar exchange and alignment with the LeRobot data layer, and ship Gymnasium adapters.
-- **P7 — Reward-free by default.** The dominant world models are reward-free latent predictors; cost and reward are optional throughout, and the canonical objective is latent distance to an encoded goal (§8.10).
+- **P7 — Reward-free by default.** Many current action-conditioned latent world models are reward-free predictors; model-provided costs are optional throughout, and the canonical reward-free objective is latent distance to an encoded goal (§8.10).
 
 ## 2. Terminology and Conventions
 
@@ -125,7 +125,7 @@ A DataRef is a tagged descriptor:
 | Channel    | Scope                  | Mechanism                                          | Copy cost |
 |------------|------------------------|----------------------------------------------------|-----------|
 | `inline`   | any (always supported) | base64 bytes (`wmcp-tensor/1`) or a small JSON array (`json-array/1`), up to `max_inline_bytes` | high; small payloads only |
-| `uri`      | remote/async           | object-store or file URI the peer fetches, session-scoped | out-of-band |
+| `uri`      | remote/async           | object-store or file URI the peer fetches; lifetime is declared by `expires_at` or access policy | out-of-band |
 | `shmem`    | same host              | POSIX shared memory or **CUDA IPC** handle; ephemeral | near-zero |
 | `dlpack`   | in-process             | DLPack capsule / object exposing `__dlpack__`; ephemeral | zero |
 | `arrow`    | local or remote        | Arrow IPC Tensor message, or Arrow Flight descriptor/ticket resolving to one | low; aligns with LeRobot |
@@ -178,7 +178,7 @@ MCP-compatible wire request (the WMCP payload rides inside MCP `initialize`):
       "experimental": { "wmcp": {
         "wmcpVersion": "wmcp/0.2-draft",              // WMCP semantic version (distinct from MCP)
         "client": { "latentImport": true, "streaming": true, "cancel": true },
-        "dataChannels": ["dlpack","shmem","arrow","inline"]
+        "dataChannels": ["shmem","arrow","inline"]
       } } } } }
 ```
 Response (`result`):
@@ -194,7 +194,7 @@ Response (`result`):
     "limits": { "max_inline_bytes": 1048576 }
   } } } }
 ```
-After a successful `initialize`, an MCP-compatible Client MUST send `notifications/initialized` before any `wm/*` call. The Client proposes `wmcpVersion`; the Server responds with the (possibly older) version it will speak, which the Client MUST accept or close the session; if no compatible MAJOR exists the Server MUST return an error and the session MUST NOT proceed (§18). In the in-process binding the constructor returns the same `sessionCapabilities`, `models`, and `limits` object.
+After a successful `initialize`, an MCP-compatible Client MUST send `notifications/initialized` before any `wm/*` call. The Client proposes `wmcpVersion`; the Server responds with the (possibly older) version it will speak, which the Client MUST accept or close the session; if no compatible MAJOR exists the Server MUST return an error and the session MUST NOT proceed (§18). If `dataChannels` is omitted, the Client proposes only `inline`; if `client` is omitted, it is the empty capability object. In the in-process binding the constructor returns the same `sessionCapabilities`, `models`, and `limits` object.
 
 Plain JSON-RPC profile `initialize` uses the WMCP payload directly as `params` (`wmcpVersion`, `clientInfo`, optional `client`, optional `dataChannels`) and returns the WMCP response fields directly in `result` (`wmcpVersion`, `serverInfo`, `binding:"wire"`, `wire_profile:"jsonrpc"`, `models`, `sessionCapabilities`, `limits`). It does not use MCP `protocolVersion`, `capabilities.experimental.wmcp`, `notifications/initialized`, or MCP transport headers.
 
@@ -258,7 +258,7 @@ Plain JSON-RPC profile `initialize` uses the WMCP payload directly as `params` (
 
 ## 8. Methods and Invariants
 
-The verb set, at a glance. "Mutates" is always *no* — every state-producing verb yields a new Handle (§8.3). Full request/response schemas are normative in Appendix A.
+The verb set, at a glance. "Mutates" is always *no* — state-advancing verbs leave their inputs unchanged and return new Handle(s) only when the method materializes Latents (§8.3). Full request/response schemas are normative in Appendix A.
 
 | Verb | Capability gate | Returns Handle(s) | Idempotent | Summary |
 |------|-----------------|:-----------------:|:----------:|---------|
@@ -281,11 +281,11 @@ The verb set, at a glance. "Mutates" is always *no* — every state-producing ve
 
 ### 8.2 Seed, determinism, and noise
 
-A `seed` is a non-negative integer or a decimal string; Servers SHOULD accept decimal strings, since seeds can exceed JSON's safe integer range (2⁵³). Every state-producing request carries one optional root seed: `wm/encode.seed`, `wm/step.seed`, or `wm/rollout.noise.seed`. If the model `requires_seed` and no request seed is given, the Server MUST assign one and return it in result `seed`; a Server MAY also echo a supplied seed after normalization.
+A `seed` is a non-negative integer or a decimal string; Servers SHOULD accept decimal strings, since seeds can exceed JSON's safe integer range (2⁵³). Every stochastic latent-producing request carries one optional root seed: `wm/encode.seed`, `wm/step.seed`, or `wm/rollout.noise.seed`. If the model `requires_seed` and no request seed is given, the Server MUST assign one and return it in result `seed`; a Server MAY also echo a supplied seed after normalization.
 
 `deterministicReplay` (per-model) advertises **logical** determinism: with the same `(Handle, action, seed)` and the same model version, hardware class, precision mode, and batch shape, the Server reproduces the same RNG draws and result up to platform floating-point reproducibility. Bitwise equality across differing hardware, precision, or batch shape — e.g. a single `wm/step` versus the same step inside a batched `wm/rollout` — is **not** implied; non-associative floating-point and nondeterministic GPU reductions make it unattainable in general. Without `deterministicReplay`, a repeated call yields an independent draw from the same distribution.
 
-**Noise control.** For batched stochastic operations a Client controls sampling via `noise: { "mode": "common" | "independent", "seed"?: <Seed | Seed[]> }`. `common` requests **common random numbers** — the same per-step noise realization across all candidates in a batch — so cost differences reflect actions, not sampling noise (the right default for shooting planners). `independent` Monte-Carlos an expectation. A single `seed` is the rollout root seed; for `independent`, `seed` MAY also be a `[N]` vector of per-candidate root seeds. Common random numbers are **not** universally implementable (diffusion samplers, adaptive compute), so they are a per-model capability `commonRandomNumbers`; a Server that cannot honor the requested mode MUST return `DETERMINISM_UNAVAILABLE` rather than silently change sampling semantics, unless the request explicitly allows downgrade. Seeds compose deterministically along a rollout (per-step seeds derived from the root seed and step index).
+**Noise control.** For batched stochastic operations a Client controls sampling via `noise: { "mode": "common" | "independent", "seed"?: <Seed | Seed[]> }`. If `noise` is omitted, the Server uses the model's default stochastic process; if the model `requires_seed`, §8.2 seed assignment still applies. `common` requests **common random numbers** — the same per-step noise realization across all candidates in a batch — so cost differences reflect actions, not sampling noise (the right default for shooting planners). `independent` Monte-Carlos an expectation. A single `seed` is the rollout root seed; for `independent`, `seed` MAY also be a `[N]` vector of per-candidate root seeds. Common random numbers are **not** universally implementable (diffusion samplers, adaptive compute), so they are a per-model capability `commonRandomNumbers`; a Server that cannot honor the requested mode MUST return `DETERMINISM_UNAVAILABLE` rather than silently change sampling semantics. Seeds compose deterministically along a rollout (per-step seeds derived from the root seed and step index).
 
 ### 8.3 No-mutation invariant (REQUIRED, core)
 
@@ -328,7 +328,7 @@ Returns a **new** Handle; the input is not mutated (§8.3). If the Server assign
 ```jsonc
 // params — actions are bulk: an [N][H][A] or [H][A] tensor by DataRef (not JSON), per P5
 { "handle": "lat_01J…",
-  "actions": { "channel":"arrow","codec":"arrow-ipc/1","ref":"flight://…","dtype":"f32","shape":[256,16,7] },
+  "actions": { "channel":"arrow","codec":"arrow-ipc/1","ref":"flight://…","dtype":"f32","shape":[2,16,7] },
   "noise": { "mode":"common", "seed":"8830124" },
   "want": ["cumulative_cost"],              // and/or "cost_per_step"
   "return_latents": "terminal",             // none | terminal | all
@@ -340,9 +340,9 @@ Returns a **new** Handle; the input is not mutated (§8.3). If the Server assign
   "cost_per_step": null, "uncertainty": null, "complete": true, "seed": "8830124" }
 ```
 
-`cumulative_cost` is the per-candidate sum of stage costs (`[N]`); `cost_per_step` is the un-summed `[N][H]`. For a single-sequence `[H][A]` request, `N = 1`. A Server advertising `rollout` MUST accept `[H][A]`; a Server advertising `batchedRollout` MUST accept both `[H][A]` and `[N][H][A]`; a Server without `batchedRollout` MUST reject `[N][H][A]` with `CAPABILITY_NOT_NEGOTIATED`. Terminal/goal cost comes separately from `wm/evaluate`. With `stream: true` (the Client MUST have advertised the session `streaming` capability), the Server emits `wm/rollout.partial` notifications — `{ request_id, completed:[indices], cost:[…], done:bool }` whose `params` carry the originating request id; JSON-RPC notifications omit the top-level `id` — then a final response, so a planner can prune early. A rollout exceeding `max_horizon` MUST fail `HORIZON_EXCEEDED`; `recommended_horizon` is advisory and never enforced. When `deadline_ms` is set (anytime planning for real-time control), the Server MUST return the best results computed by the deadline, marking the remainder incomplete (`complete:false`), rather than overrun. Unsupported native batching → Client loops `wm/rollout` or `wm/step` (§5). The parent Handle is preserved (§8.3). If the Server assigned or normalized a rollout seed, the final result includes `seed` (§8.2).
+`cumulative_cost` is the per-candidate sum of stage costs (`[N]`); `cost_per_step` is the un-summed `[N][H]`. For a single-sequence `[H][A]` request, `N = 1`. A Server advertising `rollout` MUST accept `[H][A]`; a Server advertising `batchedRollout` MUST accept both `[H][A]` and `[N][H][A]`; a Server without `batchedRollout` MUST reject `[N][H][A]` with `CAPABILITY_NOT_NEGOTIATED`. Terminal/goal cost comes separately from `wm/evaluate`. With `stream: true` (the Client MUST have advertised the session `streaming` capability), the Server emits `wm/rollout.partial` notifications — `{ request_id, completed:[indices], cost:[…], done:bool }` whose `params` carry the originating request id; JSON-RPC notifications omit the top-level `id` — then a final response, so a planner can prune early. In partial notifications, `cost` is empty unless a rollout cost was requested and computed; when present it is ordered to match `completed`. A rollout exceeding `max_horizon` MUST fail `HORIZON_EXCEEDED`; `recommended_horizon` is advisory and never enforced. When `deadline_ms` is set (anytime planning for real-time control), the Server MUST return the best results computed by the deadline, marking the remainder incomplete (`complete:false`), rather than overrun. If `complete:false`, the final result MUST include `completed`; every per-candidate result vector or DataRef in that final response is ordered by `completed` and has leading dimension `len(completed)`. If `complete:true`, `completed` MAY be omitted and is implicitly `[0, …, N-1]`. Unsupported native batching → Client loops `wm/rollout` or `wm/step` (§5). The parent Handle is preserved (§8.3). If the Server assigned or normalized a rollout seed, the final result includes `seed` (§8.2).
 
-`return_latents` controls Handle materialization: `none` returns no Latent Handles; `terminal` returns `terminal_handles:[N]`; `all` returns both `terminal_handles:[N]` and `trajectory_handles:[N][H]` (or `[H]` for an unbatched `[H][A]` request). Handles returned in `trajectory_handles` are live and independently releasable.
+`return_latents` controls Handle materialization: `none` returns no Latent Handles; `terminal` returns terminal Handles for the completed candidates; `all` returns both terminal Handles and trajectory Handles (`[N][H]`, or `[H]` for an unbatched `[H][A]` request, when `complete:true`). If `complete:false`, `terminal_handles` and `trajectory_handles` follow the `completed` indexing rule above. Handles returned in `trajectory_handles` are live and independently releasable.
 
 ### 8.7 `wm/fork`, `wm/evaluate`, `wm/decode`, `wm/cancel`
 
@@ -356,8 +356,8 @@ Returns a **new** Handle; the input is not mutated (§8.3). If the Server assign
 A Handle is **immutable** (§8.3) and **bound to the model and session that created it**: verbs other than `encode`/`describe` carry no `model_id` and infer the model from the Handle; using a Handle against another model or session MUST fail `INVALID_HANDLE`. Because Latents are immutable, concurrent operations on one Handle are safe. `ttl_ms` is a **sliding** expiry, refreshed on each successful operation that references the Handle; a Server MAY cap absolute lifetime via `limits`.
 
 - `wm/release` `{ "handles":[…] }` → `{ "released":[…], "unknown":[…] }`. Idempotent for Handles of the same session. Children created by `step`/`fork` are independent Latents; releasing a parent does **not** invalidate them. Servers MUST reclaim Latents past `ttl_ms` even absent an explicit release.
-- `wm/export` `{ "handle":"…", "codec":"arrow-ipc/1" }` → a DataRef, valid only if the latent is `exportable`. Exported latents are **logically read-only**; modifying an exported buffer is undefined behavior or grounds for import rejection. **Ephemeral vs durable:** `dlpack`/`shmem` exports are same-process/same-host, in-memory handoffs and MUST NOT be presented as durable storage. **Durable** export/import (caching across sessions, edge↔cloud transfer, benchmark fixtures) MUST use `arrow-ipc/1` or `wmcp-tensor/1` and carry metadata: `model_id`, `model_version`, `latent_schema`, `codec`, `dtype`, `shape`, `layout`, `byte_order`, and an OPTIONAL content hash.
-- `wm/import` reverses it → a Handle. The target model is identified by an explicit `model_id` or by durable DataRef metadata; `model_id` MAY be omitted only when the Server hosts a single model or the DataRef metadata identifies exactly one hosted model. It MUST validate the payload against the receiving Descriptor and MUST fail `LATENT_CODEC_MISMATCH` unless `model_id`, `model_version`, `latent_schema`, `codec`, `dtype`, and `shape` all match; a malformed tensor returns `INVALID_TENSOR`; an unknown `model_id` returns `MODEL_NOT_FOUND`. **Cross-model import is out of scope** (§17).
+- `wm/export` `{ "handle":"…", "codec":"arrow-ipc/1" }` → a DataRef, valid only if the latent is `exportable`. If `codec` is omitted, the Server selects the first durable codec in `latent.codecs` that it can produce over a negotiated data channel. Exported latents are **logically read-only**; modifying an exported buffer is undefined behavior or grounds for import rejection. **Ephemeral vs durable:** `dlpack`/`shmem` exports are same-process/same-host, in-memory handoffs and MUST NOT be presented as durable storage. **Durable** export/import (caching across sessions, edge↔cloud transfer, benchmark fixtures) MUST use `arrow-ipc/1` or `wmcp-tensor/1` and carry metadata: `model_id`, `model_version`, `latent_schema`, `codec`, `dtype`, `shape`, `layout`, `byte_order`, and an OPTIONAL content hash.
+- `wm/import` reverses it → a Handle. The target model is identified by an explicit `model_id` or by durable DataRef metadata; `model_id` MAY be omitted only when the Server hosts a single model or the DataRef metadata identifies exactly one hosted model. It MUST validate the payload against the receiving Descriptor and MUST fail `LATENT_CODEC_MISMATCH` unless `model_id`, `model_version`, `latent_schema`, `codec`, `dtype`, `shape`, and applicable `layout`/`byte_order` all match; a malformed tensor returns `INVALID_TENSOR`; an unknown `model_id` returns `MODEL_NOT_FOUND`. **Cross-model import is out of scope** (§17).
 
 ### 8.9 Differentiable rollout and gradients *(per-model `differentiable`, `grad`)*
 
@@ -371,23 +371,23 @@ Gradient-based planners — projected gradient descent, SGD/Adam trajectory opti
 { "handle": "lat_01J…",
   "actions": { "channel":"arrow","codec":"arrow-ipc/1","ref":"…","dtype":"f32","shape":[1,16,7] },
   "objective": { "type":"terminal_cost", "goal": { "type":"latent", "handle":"lat_goal…" } },
-  // objective.type: stage_cost | cumulative_cost | terminal_cost | latent
+  // objective.type: cumulative_cost | terminal_cost | latent
   "cotangent": null,                       // REQUIRED (output-shaped) when objective is non-scalar (type:latent)
   "noise": { "mode":"common", "seed":"1234" } }
 // result
 { "grad_actions": { "channel":"arrow","codec":"arrow-ipc/1","ref":"…","dtype":"f32","shape":[1,16,7] } }
 ```
-`wm/grad` returns a vector–Jacobian product, never the full Jacobian (reverse mode is what first-order optimizers need; it avoids an `O(H·A·Z)` tensor). For a scalar `objective` the cotangent is implicitly 1 and the result is `∂objective/∂actions`; for `objective:{type:latent}` the Client MUST supply a `cotangent` of the terminal Latent's shape, yielding `cotangentᵀ·∂z_terminal/∂actions`. `grad_actions` matches `actions` in shape. A Server without the requested gradient mode returns `GRADIENT_UNAVAILABLE`.
+`wm/grad` returns a vector–Jacobian product, never the full Jacobian (reverse mode is what first-order optimizers need; it avoids an `O(H·A·Z)` tensor). For a scalar `objective` the cotangent is implicitly 1 and the result is `∂objective/∂actions`; scalar cost objectives over a horizon are either `cumulative_cost` (sum of stage costs over the supplied actions) or `terminal_cost` (goal/terminal cost at the final Latent). For `objective:{type:latent}` the Client MUST supply a `cotangent` of the terminal Latent's shape, yielding `cotangentᵀ·∂z_terminal/∂actions`. `grad_actions` matches `actions` in shape. A Server without the requested gradient mode returns `GRADIENT_UNAVAILABLE`.
 
 **Degradation.** A gradient-based Client facing neither `differentiable` nor `grad` SHOULD fall back to finite differences (`O(A·H)` extra rollouts) or a sampling solver. Per §5, the planner still runs.
 
 ### 8.10 Costs, goals, and the reward-free case
 
-Most action-conditioned world models of current interest are **reward-free**: JEPA-family predictors forecast latents and define no cost. WMCP therefore makes every cost OPTIONAL (P7), declares scoring paths in the Descriptor (`scoring`, §7), and supports two patterns.
+Many action-conditioned world models of current interest are **reward-free**: JEPA-family predictors forecast latents and define no cost. WMCP therefore makes every cost OPTIONAL (P7), declares scoring paths in the Descriptor (`scoring`, §7), and supports two patterns.
 
 **Model-provided cost (optional).** If a model exposes a cost it sets `scoring.stage_cost`/`scoring.terminal_cost`; `wm/step` MAY then return `stage_cost` and `wm/evaluate` a goal `cost`. A model that returns a stage cost MUST have had the goal/task bound at `encode` through a declared observation feature or namespaced conditioning extension (carried in the latent — the goal-conditioned-observation pattern), or otherwise possess a well-defined task-independent cost. **A Server MUST NOT fabricate a cost** when no scoring semantics are available; it returns `null` for an explicitly requested unsupported cost field and otherwise omits that field.
 
-**Planner-computed latent distance (the reward-free default).** The planner encodes the goal observation once (`encode(goal_obs) → z_goal`), rolls candidates out to terminal Latents, and scores each by distance to `z_goal` via `wm/evaluate` with `goal:{type:latent, handle:z_goal}` and a `metric_id` the Server owns (§8.7). Where `evaluate` is unsupported, a `latentExport`-capable planner MAY export terminal and goal latents and apply its own metric, accepting that calibration becomes its responsibility. This — not model-supplied reward — is the dominant control pattern for current world models, and is the contract the stable-worldmodel `get_cost` hook reduces to.
+**Planner-computed latent distance (the reward-free default).** The planner encodes the goal observation once (`encode(goal_obs) → z_goal`), rolls candidates out to terminal Latents, and scores each by distance to `z_goal` via `wm/evaluate` with `goal:{type:latent, handle:z_goal}` and a `metric_id` the Server owns (§8.7). Where `evaluate` is unsupported, a `latentExport`-capable planner MAY export terminal and goal latents and apply its own metric, accepting that calibration becomes its responsibility. This is the reward-free control path WMCP makes first-class, and is the contract the stable-worldmodel `get_cost` hook reduces to.
 
 **Aggregation.** `wm/step` → `stage_cost` (one step). `wm/rollout` → `cumulative_cost` (`[N]`, Σ stage over the horizon) and/or `cost_per_step` (`[N][H]`). `wm/evaluate` → the terminal/goal `cost`. The planner composes its own objective `J = Σₜ stage(zₜ,aₜ) + terminal(z_H)`. All costs follow the minimize convention (§2).
 
@@ -412,7 +412,7 @@ loop until done:
                        stream=True, deadline_ms=control_period_ms)   # batched if native, otherwise rollout/step-loop
   costs = [server.evaluate(leaf, {"type":"latent","handle":z_goal})["cost"] for leaf in res.terminal_handles]
   a* = first action of argmin_i costs[i]
-  on new_frame_arrived: server.cancel(rollout)            # abandon stale plan, replan
+  on new_frame_arrived: server.cancel(inflight_request_id) # abandon stale plan, replan
   execute a* ; obs_{t+1} = observe()
   server.release(res.terminal_handles); h0 = server.encode(obs_{t+1})
 ```
@@ -429,7 +429,7 @@ Encodings: `raw` (values match the space) and `latent_action` (points in a learn
 
 ## 11. Uncertainty Model
 
-`uncertainty` is an extensible map. Defined keys: `epistemic`, `aleatoric`, `ensemble_std`, `reward_var`, `method`. A Server returns only keys it computes; a Client treats a missing key as "not reported," never zero. For batched methods, scalar uncertainty MAY be repeated as a scalar only when it applies to the whole result; per-candidate or per-step uncertainty MUST be returned as a DataRef with leading shape `[N]` or `[N,H]`. Uncertainty is advisory for planning (risk-aware cost, replan triggers), not a correctness guarantee.
+`uncertainty` is an extensible map. Defined keys: `epistemic`, `aleatoric`, `ensemble_std`, `cost_var`, `method`. A Server returns only keys it computes; a Client treats a missing key as "not reported," never zero. For batched methods, scalar uncertainty MAY be repeated as a scalar only when it applies to the whole result; per-candidate or per-step uncertainty MUST be returned as a DataRef with leading shape `[N]` or `[N,H]`. Uncertainty is advisory for planning (risk-aware cost, replan triggers), not a correctness guarantee.
 
 ## 12. Conformance
 
@@ -442,7 +442,7 @@ A Server claims a profile **per binding and per model** (e.g. "WMCP-Planning, in
 - **C4 (no-mutation).** `wm/step(h, a)` returns a Handle ≠ `h`; a subsequent `wm/step(h, a')` is unaffected by the first, verified by equality within tolerance against `step(h, a')` issued before the first call.
 - **C5 (determinism).** With `deterministicReplay`, `wm/step(h, a, seed)` repeated on the same device/precision/batch agrees within tolerance; without it, repeats are distributionally consistent over a sample. A requested `noise.mode`/`deterministicReplay` the model lacks returns `DETERMINISM_UNAVAILABLE`, never silent downgrade.
 - **C6 (lifecycle).** After `wm/release(h)`, operations on `h` return `INVALID_HANDLE`; a Handle past `ttl_ms` returns `EXPIRED_HANDLE`; a Handle from another session is rejected.
-- **C7 (extensibility).** Unknown namespaced capabilities and namespaced request fields are ignored, not errored (P2), unless named in `requires_extensions`, in which case the request fails `CAPABILITY_NOT_NEGOTIATED`.
+- **C7 (extensibility).** Unknown capabilities and unknown optional request fields are ignored, not errored (P2), unless named in `requires_extensions`, in which case the request fails `CAPABILITY_NOT_NEGOTIATED`.
 
 **WMCP-Planning** = Core + ≥1 scoring path (model cost, `evaluate`, `decode`, or `latentExport`):
 - **PL1 (scoring exists).** At least one declared scoring path returns or enables a finite cost for a rolled-out candidate. For `decode` or `latentExport` paths, the suite supplies a deterministic Client metric and verifies that the required data are returned.
@@ -456,7 +456,7 @@ A Server claims a profile **per binding and per model** (e.g. "WMCP-Planning, in
 
 ## 13. Error Model
 
-JSON-RPC error objects (wire) / typed exceptions (in-process) carry the numeric `code`, a `message`, and OPTIONAL `data`, reserving `-32000…-32099`:
+JSON-RPC standard errors still apply: malformed JSON and invalid request structure use JSON-RPC's standard error codes (for example `-32700`, `-32600`, `-32601`, `-32602`). WMCP domain errors use JSON-RPC error objects (wire) / typed exceptions (in-process) carrying the numeric `code`, a `message`, and OPTIONAL `data`, reserving `-32000…-32099`:
 
 | Code   | Name                       | Meaning                                  |
 |--------|----------------------------|------------------------------------------|
@@ -467,7 +467,7 @@ JSON-RPC error objects (wire) / typed exceptions (in-process) carry the numeric 
 | -32005 | LATENT_CODEC_MISMATCH      | export/import codec, schema, or version clash |
 | -32006 | LIMIT_EXCEEDED             | batch or live-handle quota exceeded      |
 | -32007 | CAPABILITY_NOT_NEGOTIATED  | method needs an unadvertised capability  |
-| -32008 | DATA_CHANNEL_UNAVAILABLE   | requested channel unsupported; retry inline |
+| -32008 | DATA_CHANNEL_UNAVAILABLE   | requested channel unsupported              |
 | -32009 | CANCELLED                  | request aborted via `wm/cancel`          |
 | -32010 | MODEL_NOT_FOUND            | unknown `model_id`                       |
 | -32011 | INVALID_TENSOR             | dtype, shape, layout, or payload invalid |
@@ -476,7 +476,7 @@ JSON-RPC error objects (wire) / typed exceptions (in-process) carry the numeric 
 | -32014 | DETERMINISM_UNAVAILABLE    | requested seed/noise semantics unsupported |
 | -32015 | GRADIENT_UNAVAILABLE       | requested gradient mode unsupported      |
 
-The `data` object MAY carry `{ handle?, request_id?, retryable: bool, detail? }`. `LIMIT_EXCEEDED` and transport failures are **retryable** (back off and retry); the rest are **terminal** for that request — the Client MUST re-establish the precondition (re-encode, renegotiate, reshape) before retrying. Because creating verbs are non-idempotent (§14), a Client retrying a transport failure SHOULD assume the original may have succeeded and reconcile Handles.
+The `data` object MAY carry `{ handle?, request_id?, retryable: bool, detail? }`. `LIMIT_EXCEEDED` and transient transport failures are retryable after backoff; `DATA_CHANNEL_UNAVAILABLE` and `PAYLOAD_TOO_LARGE` are retryable only after changing channel or payload size. Other WMCP domain errors are terminal for that request — the Client MUST re-establish the precondition (re-encode, renegotiate, reshape) before retrying. Because creating verbs are non-idempotent (§14), a Client retrying a transport failure SHOULD assume the original may have succeeded and reconcile Handles.
 
 ## 14. Operational and Security Considerations
 
@@ -484,7 +484,7 @@ The `data` object MAY carry `{ handle?, request_id?, retryable: bool, detail? }`
 - **MCP transport hardening.** A Server claiming the MCP-compatible Streamable HTTP profile MUST follow MCP transport security requirements, including `Origin` validation; local deployments SHOULD bind only to localhost, and non-local deployments SHOULD require authentication.
 - **Handle scoping.** Handles MUST be unguessable and session-scoped; a Server MUST reject a Handle from another session.
 - **Resource exhaustion.** `fork` and batched `rollout` amplify load; Servers MUST enforce advertised `limits` (live handles, batch, data-plane, `max_inline_bytes`) and fail fast (`LIMIT_EXCEEDED`, `PAYLOAD_TOO_LARGE`).
-- **Data-plane lifetime.** `shmem`/`cuda_ipc` segments MUST be reclaimed on `release`, `cancel`, or TTL; a leaked IPC handle is a host resource leak. `uri` payloads SHOULD be access-scoped to the session.
+- **Data-plane lifetime.** `shmem`/`cuda_ipc` segments MUST be reclaimed on `release`, `cancel`, or TTL; a leaked IPC handle is a host resource leak. `uri` payloads SHOULD be access-scoped to the session or explicit exported-object lifetime.
 - **Untrusted imports.** An imported Latent (`wm/import`) is untrusted input: a Server MUST validate it against the Descriptor (codec, dtype, shape, version → `INVALID_TENSOR`/`LATENT_CODEC_MISMATCH`) and MUST NOT assume it is in-distribution; a malformed or adversarial latent is an attack surface over the wire.
 - **Wire gradient latency.** `wm/grad` makes gradient-based planning well-defined over the wire, but each optimizer step pays a network round-trip; prefer the in-process binding for gradient solvers, or batch several `grad` queries per round-trip.
 - **Idempotency on retry.** `encode`, `step`, `rollout`, and `fork` create Latents and are **not** idempotent; on a transport retry a wire Client may receive duplicate Handles and SHOULD release the extras. `release`, `describe`, and `export` are idempotent.
@@ -497,7 +497,7 @@ The `data` object MAY carry `{ handle?, request_id?, retryable: bool, detail? }`
 - **Gymnasium** — generalized to branchable, non-destructive, latent-addressed dynamics with runtime capability negotiation; `action_space.kind` mirrors Gym spaces. A reference adapter wraps any WMCP Server as a (vectorized) Gym environment and vice versa.
 - **DLPack / Apache Arrow** — adopted for the in-process and batched/columnar data planes; Arrow aligns with the LeRobot data layer, and Arrow Flight is the natural remote bulk channel.
 - **RLDS / Open X-Embodiment / LeRobot** — complementary data-layer standards; WMCP reuses their `observation.*` feature naming and embodiment conventions rather than inventing a second ontology.
-- **stable-worldmodel** — an in-process, reward-free, MPC-centric world-model research platform whose `model.get_cost(info_dict, action_candidates)` ↔ `solver` boundary is exactly the seam WMCP standardizes. Its `PlanConfig` (`horizon`, `receding_horizon`, `history_len`, `action_block`, warm-start) maps onto Descriptor planning defaults and rollout parameters; WMCP's in-process binding and reward-free design (§8.10) formalize how such platforms already operate.
+- **stable-worldmodel** — an in-process, reward-free, MPC-centric world-model research platform whose `model.get_cost(info_dict, action_candidates)` ↔ `solver` boundary is a concrete instance of the interface WMCP standardizes. Its `PlanConfig` (`horizon`, `receding_horizon`, `history_len`, `action_block`, warm-start) maps onto Descriptor planning defaults and rollout parameters; WMCP's in-process binding and reward-free design (§8.10) formalize how such platforms already operate.
 
 The economic argument is the adoption argument: M planners × N models of bespoke integration collapses to M+N once both sides speak WMCP — and the binding model means M+N holds whether deployment is local, same-host, or remote.
 
@@ -543,7 +543,7 @@ WMCP is extensible at defined points, each with a registration policy in the sen
 | `want` members | `stage_cost`, `cumulative_cost`, `cost_per_step`, `uncertainty`, `latent` | Specification Required |
 | Noise modes | `common`, `independent` | Specification Required |
 | Goal types | `latent`, `observation`, `language`, `x-<vendor>/…` | Specification Required |
-| Uncertainty keys | `epistemic`, `aleatoric`, `ensemble_std`, `reward_var`, `method` | Expert Review |
+| Uncertainty keys | `epistemic`, `aleatoric`, `ensemble_std`, `cost_var`, `method` | Expert Review |
 | Latent kinds | `global_vector`, `token_sequence`, `spatial_grid`, `opaque` | Expert Review |
 | Action-space kinds | `box`, `discrete`, `multidiscrete`, `dict` | Expert Review |
 | Metric ids | `model/default`, `l2/normalized` | Expert Review |
@@ -587,7 +587,7 @@ These schemas are normative; inline JSON in §6–§8 is illustrative. Notation:
 - **Noise** = `{ mode:"common"|"independent", seed?:Seed|Seed[] }` (`Seed[]` length `N`). **Cost** = number (minimized, §2).
 - **RequestCommon** = optional `requires_extensions:string[]`; a binding MUST allow it on every `wm/*` request and apply §2 extension failure semantics before executing the method.
 
-**initialize** — req: `wmcpVersion: string`, `clientInfo:{name,version}`, `client: object (opt)`, `dataChannels: string[] (opt)` (carried under MCP `capabilities.experimental.wmcp` on the wire). res: `wmcpVersion`, `serverInfo:{name,version}`, `binding:"wire"|"in_process"`, `wire_profile:"mcp"|"jsonrpc" (req when binding="wire")`, `models: string[]`, `sessionCapabilities: object`, `limits:{max_inline_bytes,…}`. MCP-compatible Clients MUST then send `notifications/initialized`.
+**initialize** — req: `wmcpVersion: string`, `clientInfo:{name,version}`, `client: object (opt,{})`, `dataChannels: string[] (opt,["inline"])` (carried under MCP `capabilities.experimental.wmcp` on the wire). res: `wmcpVersion`, `serverInfo:{name,version}`, `binding:"wire"|"in_process"`, `wire_profile:"mcp"|"jsonrpc" (req when binding="wire")`, `models: string[]`, `sessionCapabilities: object`, `limits:{max_inline_bytes,…}`. MCP-compatible Clients MUST then send `notifications/initialized`.
 
 **wm/describe** — req: `model_id: string (opt if single model)`. res: the Descriptor (§7), including per-model `capabilities`, `scoring`, `observation`, `action_space`, `latent`, `dynamics`, `limits`.
 
@@ -595,21 +595,21 @@ These schemas are normative; inline JSON in §6–§8 is illustrative. Notation:
 
 **wm/step** — req: `handle: Handle`, `action: DataRef` (inline `json-array/1` allowed for small actions), `seed: Seed (opt)`, `want: string[] (opt, [])`. res: `handle: Handle`, `ttl_ms: int`, `seed: Seed (if assigned or normalized)`, plus requested: `stage_cost: Cost|null`, `uncertainty: object|null`, `latent: DataRef|null`.
 
-**wm/rollout** *(model cap `rollout` or `batchedRollout`)* — req: `handle: Handle`, `actions: DataRef` (`[H][A]` with `rollout`; `[N][H][A]` also allowed with `batchedRollout`), `noise: Noise (opt)`, `want: string[] (opt,["cumulative_cost"])`, `return_latents:"none"|"terminal"|"all" (opt,"terminal")`, `stream: bool (opt,false)`, `differentiable: bool (opt,false)`, `deadline_ms: int (opt)`. res: `terminal_handles: Handle[]|null`, `trajectory_handles: Handle[][]|Handle[]|null`, `cumulative_cost: DataRef|null`, `cost_per_step: DataRef|null`, `uncertainty: object|null`, `complete: bool` (false iff truncated by `deadline_ms`), `seed: Seed|Seed[] (if assigned or normalized)`. Stream notification `wm/rollout.partial`: `{ request_id, completed:int[], cost:number[], done:bool }`.
+**wm/rollout** *(model cap `rollout` or `batchedRollout`)* — req: `handle: Handle`, `actions: DataRef` (`[H][A]` with `rollout`; `[N][H][A]` also allowed with `batchedRollout`), `noise: Noise (opt)`, `want: string[] (opt,["cumulative_cost"])`, `return_latents:"none"|"terminal"|"all" (opt,"terminal")`, `stream: bool (opt,false)`, `differentiable: bool (opt,false)`, `deadline_ms: int (opt)`. res: `terminal_handles: Handle[]|null`, `trajectory_handles: Handle[][]|Handle[]|null`, `cumulative_cost: DataRef|null`, `cost_per_step: DataRef|null`, `uncertainty: object|null`, `complete: bool` (false iff truncated by `deadline_ms`), `completed: int[] (req iff complete=false)`, `seed: Seed|Seed[] (if assigned or normalized)`. Stream notification `wm/rollout.partial`: `{ request_id, completed:int[], cost:number[], done:bool }`.
 
 **wm/fork** *(model cap `fork`)* — req: `handle: Handle`, `n: int (opt,1)`. res: `handles: Handle[]`.
 
-**wm/evaluate** *(model cap `evaluate`)* — req: `handle: Handle`, `goal: Goal`, `metric_id: string (opt, "model/default")`, `want: string[] (opt,["cost"])`. res: `cost: Cost`, `metric_id: string`, `uncertainty: object|null (opt)`. Unsupported goal/metric → `GOAL_UNSUPPORTED`.
+**wm/evaluate** *(model cap `evaluate`)* — req: `handle: Handle`, `goal: Goal`, `metric_id: string (opt, "model/default")`, `want: string[] (opt,["cost"])`; `cost` is always returned and `uncertainty` may be requested. res: `cost: Cost`, `metric_id: string`, `uncertainty: object|null (opt)`. Unsupported goal/metric → `GOAL_UNSUPPORTED`.
 
 **wm/decode** *(model cap `decode`)* — req: `handle: Handle`, `modalities: string[] (opt, all)`. res: FeatureMap (per modality, a DataRef).
 
 **wm/release** — req: `handles: Handle[]`. res: `released: Handle[]`, `unknown: Handle[]`.
 
-**wm/export** *(model cap `latentExport`)* — req: `handle: Handle`, `codec: string (opt, first durable)`. res: a DataRef (`readonly:true`; durable codecs carry the §8.8 metadata).
+**wm/export** *(model cap `latentExport`)* — req: `handle: Handle`, `codec: string (opt)`. If omitted, the default is the first durable codec in `latent.codecs` compatible with the negotiated data channels. res: a DataRef (`readonly:true`; durable codecs carry the §8.8 metadata).
 
-**wm/import** *(model cap `latentImport`)* — req: `data: DataRef`, `model_id: string (opt per §8.8)`, `model_version: string`, `latent_schema: string`. res: `handle: Handle`. Errors `MODEL_NOT_FOUND` / `LATENT_CODEC_MISMATCH` / `INVALID_TENSOR`.
+**wm/import** *(model cap `latentImport`)* — req: `data: DataRef`, `model_id: string (opt per §8.8)`, `model_version: string (opt if in data.metadata)`, `latent_schema: string (opt if in data.metadata)`. res: `handle: Handle`. Errors `MODEL_NOT_FOUND` / `LATENT_CODEC_MISMATCH` / `INVALID_TENSOR`.
 
-**wm/grad** *(model cap `grad`)* — req: `handle: Handle`, `actions: DataRef`, `objective:{type:"stage_cost"|"cumulative_cost"|"terminal_cost"|"latent"[, goal:Goal]} (opt,{type:"cumulative_cost"})`, `cotangent: DataRef|null (req when objective type is latent)`, `noise: Noise (opt)`. res: `grad_actions: DataRef` (shape of `actions`). Unsupported mode → `GRADIENT_UNAVAILABLE`.
+**wm/grad** *(model cap `grad`)* — req: `handle: Handle`, `actions: DataRef`, `objective:{type:"cumulative_cost"|"terminal_cost"|"latent"[, goal:Goal]} (opt,{type:"cumulative_cost"})`, `cotangent: DataRef|null (req when objective type is latent)`, `noise: Noise (opt)`. res: `grad_actions: DataRef` (shape of `actions`). Unsupported mode → `GRADIENT_UNAVAILABLE`.
 
 **wm/cancel** *(session cap `cancel`)* — req: `request_id: int|string`. res: `cancelled: bool`. Releases Latents the aborted call began to produce (§8.7).
 
@@ -644,17 +644,17 @@ A reward-free MPC cycle. Tensor payloads are shown as DataRef placeholders.
 ← {"jsonrpc":"2.0","id":4,"result":{"handle":"h0","ttl_ms":60000}}
 
 → {"jsonrpc":"2.0","id":5,"method":"wm/rollout","params":{"handle":"h0",
-     "actions":{"channel":"arrow","codec":"arrow-ipc/1","ref":"arrow://A","dtype":"f32","shape":[256,16,7]},
+     "actions":{"channel":"arrow","codec":"arrow-ipc/1","ref":"arrow://A","dtype":"f32","shape":[4,16,7]},
      "noise":{"mode":"common","seed":"8830124"},"want":[],"return_latents":"terminal","stream":true,"deadline_ms":40}}
-← {"jsonrpc":"2.0","method":"wm/rollout.partial","params":{"request_id":5,"completed":[0,1,2,3],"cost":[],"done":false}}
-← {"jsonrpc":"2.0","id":5,"result":{"terminal_handles":["leaf_0","leaf_1"],"complete":true}}
+← {"jsonrpc":"2.0","method":"wm/rollout.partial","params":{"request_id":5,"completed":[0,1],"cost":[],"done":false}}
+← {"jsonrpc":"2.0","id":5,"result":{"terminal_handles":["leaf_0","leaf_1","leaf_2","leaf_3"],"complete":true}}
 
 → {"jsonrpc":"2.0","id":6,"method":"wm/evaluate","params":{"handle":"leaf_0","goal":{"type":"latent","handle":"z_goal"},"metric_id":"model/default"}}
 ← {"jsonrpc":"2.0","id":6,"result":{"cost":0.12,"metric_id":"model/default"}}
    // … score the other leaves, pick argmin, execute its first action …
 
-→ {"jsonrpc":"2.0","id":7,"method":"wm/release","params":{"handles":["leaf_0","leaf_1","h0"]}}
-← {"jsonrpc":"2.0","id":7,"result":{"released":["leaf_0","leaf_1","h0"],"unknown":[]}}
+→ {"jsonrpc":"2.0","id":7,"method":"wm/release","params":{"handles":["leaf_0","leaf_1","leaf_2","leaf_3","h0"]}}
+← {"jsonrpc":"2.0","id":7,"result":{"released":["leaf_0","leaf_1","leaf_2","leaf_3","h0"],"unknown":[]}}
    // re-encode the next observation and repeat; z_goal is kept across the loop.
 ```
 
