@@ -92,7 +92,7 @@ The wire binding uses JSON-RPC 2.0 control-plane messages. A Server claiming the
 
 Control-plane messages carry Handles and small scalars as JSON; bulk tensors travel on a negotiated data channel (§4), referenced from the control plane by DataRef. Bulk tensors MUST NOT be forced through JSON except via the bounded `inline` fallback (subject to `limits.max_inline_bytes`, §4).
 
-When the MCP-compatible profile is used, WMCP MUST follow the MCP lifecycle (§6.1): MCP `initialize` is the first request (carrying `clientInfo`/`serverInfo`); WMCP's semantic version and capabilities are carried inside an `experimental.wmcp` capability object; the Client sends `notifications/initialized` before normal WMCP operation. The MCP transport protocol version (the `MCP-Protocol-Version` header) and the WMCP semantic version (`wmcpVersion`) are **distinct** and negotiated independently. That profile inherits MCP transport, authentication (e.g. OAuth on Streamable HTTP), and observability; WMCP adds no authentication surface of its own.
+When the MCP-compatible profile is used, WMCP MUST follow the MCP lifecycle (§6.1): MCP `initialize` is the first request (carrying `clientInfo`/`serverInfo`); WMCP's semantic version and capabilities are carried inside an `experimental.wmcp` capability object; the Client sends `notifications/initialized` before normal WMCP operation. The MCP transport protocol version (the `MCP-Protocol-Version` header) and the WMCP semantic version (`wmcpVersion`) are **distinct** and negotiated independently. That profile inherits MCP transport, authentication (e.g. OAuth on Streamable HTTP), and observability; WMCP adds no authentication surface of its own. In the MCP-compatible profile MCP's own request cancellation also applies: a `notifications/cancelled` whose `requestId` matches an in-flight streaming `wm/rollout` MUST be treated as equivalent to `wm/cancel` for that request (§8.7), and `wm/cancel`'s `request_id` for a streaming rollout is the JSON-RPC `id` of the originating request — the two are aliases, not competing mechanisms (for task-augmented MCP requests, MCP's `tasks/cancel` request is the corresponding native mechanism).
 
 ### 3.4 One adapter, both bindings
 
@@ -133,6 +133,8 @@ A DataRef is a tagged descriptor:
 `inline` MUST be implemented by every binding up to `max_inline_bytes` for both `json-array/1` and `wmcp-tensor/1`. An inline DataRef MUST contain exactly one of `value` (`json-array/1`) or `bytes` (`wmcp-tensor/1`). `value` is a nested JSON array matching `shape` in row-major order (numbers for numeric dtypes, booleans for `bool`). `bytes` is base64 of contiguous raw tensor bytes interpreted by `dtype`, `shape`, `layout`, and `byte_order`; `strides` MUST be `null` or omitted for `wmcp-tensor/1`. Payloads beyond `max_inline_bytes` (the UTF-8 JSON byte length for `value`, decoded byte length for `bytes`) require another negotiated channel and otherwise return `PAYLOAD_TOO_LARGE`. A Client requesting an unavailable channel receives `DATA_CHANNEL_UNAVAILABLE` and SHOULD retry on `inline` (within the bound). The in-process binding uses `dlpack` by default and never base64-encodes.
 
 **Channel vs codec.** A **channel** is how bytes move; a **codec** is how a tensor is serialized within it. `dlpack`/`shmem` are *ephemeral* (in-memory exchange, not storage); `arrow-ipc/1` and `wmcp-tensor/1` are *durable* codecs suitable for export/import (§8.8). For WMCP tensors, `arrow-ipc/1` is the Arrow encapsulated Tensor IPC message for one dense tensor; a DataRef never relies on an ad hoc RecordBatch schema for core tensor exchange. A Server MUST validate an incoming DataRef against the receiving schema and reject a malformed one with `INVALID_TENSOR`.
+
+**Device-buffer synchronization.** For device-resident zero-copy channels (`dlpack`, and `shmem`/CUDA IPC carrying device memory), the producer MUST make the buffer stream-ordered-safe for the consumer before the DataRef is observed: for `dlpack` via the DLPack producer–consumer stream-exchange contract (`__dlpack__(stream=…)`), and for a CUDA IPC buffer by recording an event — or synchronizing the producing stream — that the consumer waits on before its first read. A consumer MUST NOT read a device buffer before this synchronization completes. A producer MAY surface the synchronizing stream or event in DataRef `metadata` (e.g. `metadata.cuda_event`). This applies to the in-process and same-host bindings and is a no-op for host-resident `inline`/`uri`/`arrow` payloads.
 
 **WMCP dtype aliases.** DLPack's C-level dtype is `(code, bits, lanes)`, not a string; WMCP defines string aliases (all `lanes = 1`) and their DLPack mapping. A binding MUST map aliases as follows (DLPack codes: Int=0, UInt=1, Float=2, BFloat=4, Bool=6):
 
@@ -331,16 +333,18 @@ Returns a **new** Handle; the input is not mutated (§8.3). If the Server assign
   "actions": { "channel":"arrow","codec":"arrow-ipc/1","ref":"flight://…","dtype":"f32","shape":[2,16,7] },
   "noise": { "mode":"common", "seed":"8830124" },
   "want": ["cumulative_cost"],              // and/or "cost_per_step"
+  "objective": { "goal": { "type":"latent", "handle":"z_goal" }, "metric_id":"model/default" },  // OPTIONAL (§8.10); needs `evaluate`
   "return_latents": "terminal",             // none | terminal | all
   "stream": true, "differentiable": false,  // §8.9
   "deadline_ms": null }                      // optional anytime budget
 // result
 { "terminal_handles": ["lat_a…","lat_b…"],
   "cumulative_cost": { "channel":"inline","codec":"json-array/1","value":[0.12,0.17],"dtype":"f32","shape":[2] },
+  "objective_cost":  { "channel":"inline","codec":"json-array/1","value":[0.31,0.24],"dtype":"f32","shape":[2] },
   "cost_per_step": null, "uncertainty": null, "complete": true, "seed": "8830124" }
 ```
 
-`cumulative_cost` is the per-candidate sum of stage costs (`[N]`); `cost_per_step` is the un-summed `[N][H]`. For a single-sequence `[H][A]` request, `N = 1`. A Server advertising `rollout` MUST accept `[H][A]`; a Server advertising `batchedRollout` MUST accept both `[H][A]` and `[N][H][A]`; a Server without `batchedRollout` MUST reject `[N][H][A]` with `CAPABILITY_NOT_NEGOTIATED`. Terminal/goal cost comes separately from `wm/evaluate`. With `stream: true` (the Client MUST have advertised the session `streaming` capability), the Server emits `wm/rollout.partial` notifications — `{ request_id, completed:[indices], cost:[…], done:bool }` whose `params` carry the originating request id; JSON-RPC notifications omit the top-level `id` — then a final response, so a planner can prune early. In partial notifications, `cost` is empty unless a rollout cost was requested and computed; when present it is ordered to match `completed`. A rollout exceeding `max_horizon` MUST fail `HORIZON_EXCEEDED`; `recommended_horizon` is advisory and never enforced. When `deadline_ms` is set (anytime planning for real-time control), the Server MUST return the best results computed by the deadline, marking the remainder incomplete (`complete:false`), rather than overrun. If `complete:false`, the final result MUST include `completed`; every per-candidate result vector or DataRef in that final response is ordered by `completed` and has leading dimension `len(completed)`. If `complete:true`, `completed` MAY be omitted and is implicitly `[0, …, N-1]`. Unsupported native batching → Client loops `wm/rollout` or `wm/step` (§5). The parent Handle is preserved (§8.3). If the Server assigned or normalized a rollout seed, the final result includes `seed` (§8.2).
+`cumulative_cost` is the per-candidate sum of stage costs (`[N]`); `cost_per_step` is the un-summed `[N][H]`. For a single-sequence `[H][A]` request, `N = 1`. A Server advertising `rollout` MUST accept `[H][A]`; a Server advertising `batchedRollout` MUST accept both `[H][A]` and `[N][H][A]`; a Server without `batchedRollout` MUST reject `[N][H][A]` with `CAPABILITY_NOT_NEGOTIATED`. Terminal/goal cost comes from `wm/evaluate` (§8.7) or — as a round-trip optimization for the dominant shooting pattern — from the OPTIONAL `objective` field: when set, and the model advertises `evaluate`, the Server scores each candidate's terminal Latent against `objective.goal` using the Server-owned `objective.metric_id` (§8.7) and returns `objective_cost` (`[N]`, minimize convention §2), exactly as if `wm/evaluate` had been called on each terminal Handle. `objective` is independent of `want`/`return_latents`, so the planner still composes its overall objective `J = Σ stage + terminal` (§8.10); a goal type or metric the model does not support fails `GOAL_UNSUPPORTED`, and `objective` supplied without the `evaluate` capability fails `CAPABILITY_NOT_NEGOTIATED`. With `stream: true` (the Client MUST have advertised the session `streaming` capability), the Server emits `wm/rollout.partial` notifications — `{ request_id, completed:[indices], cost:[…], done:bool }` whose `params` carry the originating request id; JSON-RPC notifications omit the top-level `id` — then a final response, so a planner can prune early. In partial notifications, `cost` is empty unless a rollout cost was requested and computed; when present it is ordered to match `completed`. A rollout exceeding `max_horizon` MUST fail `HORIZON_EXCEEDED`; `recommended_horizon` is advisory and never enforced. When `deadline_ms` is set (anytime planning for real-time control), the Server MUST return the best results computed by the deadline, marking the remainder incomplete (`complete:false`), rather than overrun. If `complete:false`, the final result MUST include `completed`; every per-candidate result vector or DataRef in that final response is ordered by `completed` and has leading dimension `len(completed)`. If `complete:true`, `completed` MAY be omitted and is implicitly `[0, …, N-1]`. Unsupported native batching → Client loops `wm/rollout` or `wm/step` (§5). The parent Handle is preserved (§8.3). If the Server assigned or normalized a rollout seed, the final result includes `seed` (§8.2).
 
 `return_latents` controls Handle materialization: `none` returns no Latent Handles; `terminal` returns terminal Handles for the completed candidates; `all` returns both terminal Handles and trajectory Handles (`[N][H]`, or `[H]` for an unbatched `[H][A]` request, when `complete:true`). If `complete:false`, `terminal_handles` and `trajectory_handles` follow the `completed` indexing rule above. Handles returned in `trajectory_handles` are live and independently releasable.
 
@@ -349,7 +353,7 @@ Returns a **new** Handle; the input is not mutated (§8.3). If the Server assign
 - `wm/fork` *(per-model `fork`)* `{ "handle":"…", "n":4 }` → `{ "handles":[…] }`. Returns `n` additional Handles aliasing the **same** immutable Latent (refcounted, zero-copy — not successors, not copies); each may then be advanced independently. Per §8.3 the no-mutation invariant already permits branching without it.
 - `wm/evaluate` *(per-model `evaluate`)* scores a Latent against a `goal` (tagged union: `latent` | `observation` | `language`; external reward-model goals only via a namespaced extension) using a named `metric_id` → `{ "cost":0.17, "metric_id":"model/default", "uncertainty":null }`, lower being closer. The **Server owns the metric**: for `goal:{type:latent}` only the model can declare which distance or learned scorer its latent geometry supports, via `scoring.metric_ids` (§7). Client-side latent metrics are valid only when the Client explicitly accepts responsibility for their calibration (§8.10). An unsupported goal type or metric returns `GOAL_UNSUPPORTED`. See §8.10.
 - `wm/decode` *(per-model `decode`)* `{ "handle":"…", "modalities":["observation.images.front"] }` → frames via DataRef. Inspection / human-in-the-loop / client-side scoring only.
-- `wm/cancel` *(session `cancel`)* `{ "request_id": 42 }` aborts an in-flight streaming `rollout`, returning `CANCELLED` for that request. REQUIRED for responsive real-time replanning: on a new observation the planner cancels the stale rollout and re-encodes. In-process, cancellation is cooperative. Latents the aborted call began to produce are released; their Handles thereafter return `INVALID_HANDLE`.
+- `wm/cancel` *(session `cancel`)* `{ "request_id": 42 }` aborts an in-flight streaming `rollout`, returning `CANCELLED` for that request. In the MCP-compatible profile an MCP `notifications/cancelled` for the rollout's request id is an equivalent trigger (§3.3). REQUIRED for responsive real-time replanning: on a new observation the planner cancels the stale rollout and re-encodes. In-process, cancellation is cooperative. Latents the aborted call began to produce are released; their Handles thereafter return `INVALID_HANDLE`.
 
 ### 8.8 Lifecycle: `wm/release`, `wm/export`, `wm/import`
 
@@ -389,7 +393,7 @@ Many action-conditioned world models of current interest are **reward-free**: JE
 
 **Planner-computed latent distance (the reward-free default).** The planner encodes the goal observation once (`encode(goal_obs) → z_goal`), rolls candidates out to terminal Latents, and scores each by distance to `z_goal` via `wm/evaluate` with `goal:{type:latent, handle:z_goal}` and a `metric_id` the Server owns (§8.7). Where `evaluate` is unsupported, a `latentExport`-capable planner MAY export terminal and goal latents and apply its own metric, accepting that calibration becomes its responsibility. This is the reward-free control path WMCP makes first-class, and is the contract the stable-worldmodel `get_cost` hook reduces to.
 
-**Aggregation.** `wm/step` → `stage_cost` (one step). `wm/rollout` → `cumulative_cost` (`[N]`, Σ stage over the horizon) and/or `cost_per_step` (`[N][H]`). `wm/evaluate` → the terminal/goal `cost`. The planner composes its own objective `J = Σₜ stage(zₜ,aₜ) + terminal(z_H)`. All costs follow the minimize convention (§2).
+**Aggregation.** `wm/step` → `stage_cost` (one step). `wm/rollout` → `cumulative_cost` (`[N]`, Σ stage over the horizon) and/or `cost_per_step` (`[N][H]`). `wm/evaluate` → the terminal/goal `cost`; `wm/rollout.objective` → `objective_cost` (`[N]`), the same terminal/goal cost folded into the rollout response for shooting batches (§8.6). The planner composes its own objective `J = Σₜ stage(zₜ,aₜ) + terminal(z_H)`. All costs follow the minimize convention (§2).
 
 ## 9. Worked Example: one planner, both modes
 
@@ -408,9 +412,10 @@ z_goal = server.encode(goal_obs)                         # reward-free: encode t
 h0     = server.encode(obs_t)
 loop until done:
   A  = sample N action seqs of length H within desc.action_space, N ≤ desc.limits.max_batch
-  res = server.rollout(h0, A, noise={"mode":"common"}, return_latents="terminal",
-                       stream=True, deadline_ms=control_period_ms)   # batched if native, otherwise rollout/step-loop
-  costs = [server.evaluate(leaf, {"type":"latent","handle":z_goal})["cost"] for leaf in res.terminal_handles]
+  res = server.rollout(h0, A, noise={"mode":"common"},
+                       objective={"goal":{"type":"latent","handle":z_goal}},  # fold goal scoring in (§8.6); needs `evaluate`
+                       return_latents="terminal", stream=True, deadline_ms=control_period_ms)
+  costs = res.objective_cost                          # [N]; w/o rollout.objective → batch wm/evaluate the terminals; w/o evaluate → decode/export + client metric (§5, §8.10)
   a* = first action of argmin_i costs[i]
   on new_frame_arrived: server.cancel(inflight_request_id) # abandon stale plan, replan
   execute a* ; obs_{t+1} = observe()
@@ -484,7 +489,8 @@ The `data` object MAY carry `{ handle?, request_id?, retryable: bool, detail? }`
 - **MCP transport hardening.** A Server claiming the MCP-compatible Streamable HTTP profile MUST follow MCP transport security requirements, including `Origin` validation; local deployments SHOULD bind only to localhost, and non-local deployments SHOULD require authentication.
 - **Handle scoping.** Handles MUST be unguessable and session-scoped; a Server MUST reject a Handle from another session.
 - **Resource exhaustion.** `fork` and batched `rollout` amplify load; Servers MUST enforce advertised `limits` (live handles, batch, data-plane, `max_inline_bytes`) and fail fast (`LIMIT_EXCEEDED`, `PAYLOAD_TOO_LARGE`).
-- **Data-plane lifetime.** `shmem`/`cuda_ipc` segments MUST be reclaimed on `release`, `cancel`, or TTL; a leaked IPC handle is a host resource leak. `uri` payloads SHOULD be access-scoped to the session or explicit exported-object lifetime.
+- **Data-plane lifetime.** `shmem`/`cuda_ipc` segments MUST be reclaimed on `release`, `cancel`, or TTL; a leaked IPC handle is a host resource leak.
+- **URI data-plane fetches (SSRF).** A Server that fetches a `uri`-channel DataRef MUST restrict fetches to an explicit scheme/host allowlist, enforce a maximum content length (rejecting larger payloads with `PAYLOAD_TOO_LARGE`), and validate the declared content type (rejecting a mismatch with `INVALID_TENSOR`); it MUST NOT follow a `uri` to internal or link-local addresses unless explicitly allowlisted. `uri` payloads SHOULD be access-scoped to the session or the explicit exported-object lifetime.
 - **Untrusted imports.** An imported Latent (`wm/import`) is untrusted input: a Server MUST validate it against the Descriptor (codec, dtype, shape, version → `INVALID_TENSOR`/`LATENT_CODEC_MISMATCH`) and MUST NOT assume it is in-distribution; a malformed or adversarial latent is an attack surface over the wire.
 - **Wire gradient latency.** `wm/grad` makes gradient-based planning well-defined over the wire, but each optimizer step pays a network round-trip; prefer the in-process binding for gradient solvers, or batch several `grad` queries per round-trip.
 - **Idempotency on retry.** `encode`, `step`, `rollout`, and `fork` create Latents and are **not** idempotent; on a transport retry a wire Client may receive duplicate Handles and SHOULD release the extras. `release`, `describe`, and `export` are idempotent.
@@ -572,6 +578,12 @@ A future WM-RFC SHOULD designate a maintainer (a neutral working group or hub un
 - Zhou, G. et al. *DINO-WM: World Models on Pre-trained Visual Features.* arXiv:2411.04983, 2024.
 - Sobal, V. et al. *PLDM: Pixel-space Latent Dynamics Models.* 2025.
 - Balestriero, R., LeCun, Y. *LeJEPA / SIGReg: Isotropic-Gaussian latent regularization.* 2025.
+- Meta FAIR. *V-JEPA 2: Self-Supervised Video Models Enable Understanding, Prediction and Planning.* arXiv:2506.09985, 2025.
+- Bruce, J. et al. (DeepMind). *Genie: Generative Interactive Environments.* arXiv:2402.15391, 2024.
+- Hafner, D. et al. *Mastering Diverse Domains through World Models (DreamerV3).* arXiv:2301.04104, 2023.
+- Hansen, N. et al. *TD-MPC2: Scalable, Robust World Models for Continuous Control.* arXiv:2310.16828, 2023.
+- NVIDIA. *Cosmos World Foundation Model Platform for Physical AI.* arXiv:2501.03575, 2025.
+- *LeWorldModel: Stable End-to-End Joint-Embedding Predictive Architecture from Pixels.* arXiv:2603.19312, 2026.
 - Maes, L., Le Lidec, Q., Haramati, D., Massaudi, N., Scieur, D., LeCun, Y., Balestriero, R. *stable-worldmodel: Reproducible World Modeling Research and Evaluation.* arXiv:2602.08968, 2026.
 - Mitchell, M. et al. *Model Cards for Model Reporting.* FAT* 2019.
 
@@ -645,16 +657,17 @@ A reward-free MPC cycle. Tensor payloads are shown as DataRef placeholders.
 
 → {"jsonrpc":"2.0","id":5,"method":"wm/rollout","params":{"handle":"h0",
      "actions":{"channel":"arrow","codec":"arrow-ipc/1","ref":"arrow://A","dtype":"f32","shape":[4,16,7]},
-     "noise":{"mode":"common","seed":"8830124"},"want":[],"return_latents":"terminal","stream":true,"deadline_ms":40}}
+     "noise":{"mode":"common","seed":"8830124"},
+     "objective":{"goal":{"type":"latent","handle":"z_goal"},"metric_id":"model/default"},
+     "want":[],"return_latents":"terminal","stream":true,"deadline_ms":40}}
 ← {"jsonrpc":"2.0","method":"wm/rollout.partial","params":{"request_id":5,"completed":[0,1],"cost":[],"done":false}}
-← {"jsonrpc":"2.0","id":5,"result":{"terminal_handles":["leaf_0","leaf_1","leaf_2","leaf_3"],"complete":true}}
+← {"jsonrpc":"2.0","id":5,"result":{"terminal_handles":["leaf_0","leaf_1","leaf_2","leaf_3"],
+     "objective_cost":{"channel":"inline","codec":"json-array/1","value":[0.12,0.21,0.17,0.34],"dtype":"f32","shape":[4]},"complete":true}}
+   // costs returned in the rollout — pick argmin (leaf_0), execute its first action. (Batched wm/evaluate
+   // over handles[] is the path for scoring forked/imported latents this rollout did not produce.)
 
-→ {"jsonrpc":"2.0","id":6,"method":"wm/evaluate","params":{"handle":"leaf_0","goal":{"type":"latent","handle":"z_goal"},"metric_id":"model/default"}}
-← {"jsonrpc":"2.0","id":6,"result":{"cost":0.12,"metric_id":"model/default"}}
-   // … score the other leaves, pick argmin, execute its first action …
-
-→ {"jsonrpc":"2.0","id":7,"method":"wm/release","params":{"handles":["leaf_0","leaf_1","leaf_2","leaf_3","h0"]}}
-← {"jsonrpc":"2.0","id":7,"result":{"released":["leaf_0","leaf_1","leaf_2","leaf_3","h0"],"unknown":[]}}
+→ {"jsonrpc":"2.0","id":6,"method":"wm/release","params":{"handles":["leaf_0","leaf_1","leaf_2","leaf_3","h0"]}}
+← {"jsonrpc":"2.0","id":6,"result":{"released":["leaf_0","leaf_1","leaf_2","leaf_3","h0"],"unknown":[]}}
    // re-encode the next observation and repeat; z_goal is kept across the loop.
 ```
 
